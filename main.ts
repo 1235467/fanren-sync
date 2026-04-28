@@ -1,31 +1,55 @@
 import { Hono } from "npm:hono";
 import { cors } from "npm:hono/cors";
 import "jsr:@std/dotenv/load"; // 自动加载 .env 文件
-import { get as getBlob, set as setBlob, remove as removeBlob } from "jsr:@kitsonk/kv-toolbox/blob";
+import pg from "npm:pg"; // 引入 PostgreSQL 官方客户端
 
 // --- 配置 ---
-// 优先读取大写 SYNC_PASSWORD，兼容小写 sync_password
 const syncPassword = Deno.env.get("SYNC_PASSWORD") || Deno.env.get("sync_password");
 
-// 初始化 Deno KV
-const kv = await Deno.openKv();
-const KV_PREFIX = "archives";
+// 初始化 PostgreSQL 连接池
+// Deno Deploy 会自动读取环境变量中的 DATABASE_URL，无需手动传参
+// 但为了兼容本地 .env 读取，我们显式传入
+const pool = new pg.Pool({
+  connectionString: Deno.env.get("DATABASE_URL"),
+  // Neon Serverless 建议设置适当的超时，避免僵尸连接
+  connectionTimeoutMillis: 5000, 
+});
+
+// --- 初始化数据库表 ---
+async function initDB() {
+  const client = await pool.connect();
+  try {
+    // 自动创建 cloud_saves 表。利用 JSONB 类型容纳一切未知结构
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS cloud_saves (
+        id SERIAL PRIMARY KEY,
+        archive_name TEXT UNIQUE NOT NULL,
+        data JSONB NOT NULL,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+  } catch (err) {
+    console.error("初始化数据库失败:", err);
+  } finally {
+    client.release();
+  }
+}
+// 启动时自动建表
+await initDB();
 
 // --- 应用实例 ---
 const app = new Hono();
 
-// --- 自定义日志中间件 (替代原版 Uvicorn TranslationFilter) ---
+// --- 自定义日志中间件 ---
 app.use("*", async (c, next) => {
   const start = Date.now();
   await next();
   const ms = Date.now() - start;
   
-  // 格式化时间
   const now = new Date();
   const timeStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
   
   try {
-    // 解码 URL 并清理本地 IP 显示
     let decodedUrl = decodeURIComponent(c.req.url);
     decodedUrl = decodedUrl.replace("0.0.0.0", "localhost").replace("127.0.0.1", "localhost");
     console.log(`${timeStr} - INFO - ${c.req.method} ${decodedUrl} - Status: ${c.res.status} - ${ms}ms`);
@@ -36,7 +60,7 @@ app.use("*", async (c, next) => {
 
 // --- CORS 配置 ---
 app.use("*", cors({
-  origin: "*", // 允许所有来源
+  origin: "*", 
   allowMethods: ["*"],
   allowHeaders: ["*"],
   credentials: true,
@@ -45,7 +69,6 @@ app.use("*", cors({
 // --- 异常处理 ---
 app.onError((err, c) => {
   console.error("服务器错误:", err);
-  // HTTP 异常统一格式
   const status = (err as any).status || 500;
   return c.json({ 
     success: false, 
@@ -55,7 +78,6 @@ app.onError((err, c) => {
 
 // --- 安全辅助函数 ---
 function sanitizeFilename(filename: string): string {
-  // 清理文件名，允许 Unicode 字母、数字、下划线和连字符
   const sanitized = filename.replace(/[^\p{L}\p{N}_\-]/gu, '');
   return sanitized.substring(0, 100);
 }
@@ -75,15 +97,10 @@ api.use("*", async (c, next) => {
 // GET /list
 api.get("/list", async (c) => {
   try {
-    const archives = new Set<string>();
-    // 列出该前缀下的所有键
-    const entries = kv.list({ prefix: [KV_PREFIX] });
-    for await (const entry of entries) {
-      // Deno KV 存储结构形如 ["archives", "存档名", ...]
-      const name = entry.key[1] as string;
-      if (name) archives.add(name);
-    }
-    return c.json({ success: true, archives: Array.from(archives) });
+    // 从数据库查出所有的存档名
+    const result = await pool.query("SELECT archive_name FROM cloud_saves ORDER BY updated_at DESC");
+    const archives = result.rows.map(row => row.archive_name);
+    return c.json({ success: true, archives });
   } catch (e: any) {
     return c.json({ success: false, error: `无法列出存档: ${e.message}` }, 500);
   }
@@ -96,17 +113,15 @@ api.get("/load", async (c) => {
 
   const safeFilename = sanitizeFilename(archiveName);
   try {
-    // 使用 blob 从 KV 提取切片数据
-    const dataUint8 = await getBlob(kv, [KV_PREFIX, safeFilename]);
-    if (!dataUint8 || dataUint8.length === 0) {
+    // 根据存档名查找 JSONB 数据
+    const result = await pool.query("SELECT data FROM cloud_saves WHERE archive_name = $1", [safeFilename]);
+    
+    if (result.rowCount === 0) {
       return c.json({ success: false, error: "存档未找到" }, 404);
     }
     
-    // Uint8Array 转 JSON Object
-    const dataStr = new TextDecoder().decode(dataUint8);
-    const jsonData = JSON.parse(dataStr);
-    
-    return c.json({ success: true, data: jsonData });
+    // pg 驱动会自动将 JSONB 字段解析为 JavaScript 对象，直接返回即可
+    return c.json({ success: true, data: result.rows[0].data });
   } catch (e: any) {
     return c.json({ success: false, error: `无法加载存档: ${e.message}` }, 500);
   }
@@ -118,7 +133,6 @@ api.post("/save", async (c) => {
     const payload = await c.req.json();
     let archiveName = payload.archiveName;
     
-    // 如果顶级没有 archiveName，尝试从内部获取
     if (!archiveName && payload.data && typeof payload.data === "object") {
       archiveName = payload.data._internalName;
     }
@@ -133,11 +147,15 @@ api.post("/save", async (c) => {
     const safeFilename = sanitizeFilename(archiveName);
     console.log(`正在保存存档: 原始名称='${archiveName}', 安全名称='${safeFilename}'`);
 
-    // 将 JSON 转为 Uint8Array 以利用 blob 切片存储
-    const dataStr = JSON.stringify(payload.data);
-    const dataUint8 = new TextEncoder().encode(dataStr);
-
-    await setBlob(kv, [KV_PREFIX, safeFilename], dataUint8);
+    // 使用 Postgres 的 UPSERT 语法：有则更新，无则插入
+    // 注意：pg 驱动会自动将 payload.data 序列化存入 JSONB 字段
+    await pool.query(
+      `INSERT INTO cloud_saves (archive_name, data) 
+       VALUES ($1, $2) 
+       ON CONFLICT (archive_name) 
+       DO UPDATE SET data = EXCLUDED.data, updated_at = CURRENT_TIMESTAMP`,
+      [safeFilename, payload.data]
+    );
     
     return c.json({ success: true, message: "存档已成功保存" });
   } catch (e: any) {
@@ -153,13 +171,12 @@ api.delete("/delete", async (c) => {
 
   const safeFilename = sanitizeFilename(archiveName);
   try {
-    // 检查是否存在
-    const exists = await getBlob(kv, [KV_PREFIX, safeFilename]);
-    if (!exists || exists.length === 0) {
+    const result = await pool.query("DELETE FROM cloud_saves WHERE archive_name = $1", [safeFilename]);
+    
+    if (result.rowCount === 0) {
       return c.json({ success: false, error: "存档未找到" }, 404);
     }
 
-    await removeBlob(kv, [KV_PREFIX, safeFilename]);
     return c.json({ success: true, message: "存档已成功删除" });
   } catch (e: any) {
     return c.json({ success: false, error: `无法删除存档: ${e.message}` }, 500);
@@ -211,10 +228,12 @@ function printBanner(host: string, port: number, version: string, storageMode: s
 if (!syncPassword) {
   console.error("错误: 环境变量 SYNC_PASSWORD 未设置。");
   console.error("请在项目根目录创建一个 .env 文件并设置 SYNC_PASSWORD。");
+} else if (!Deno.env.get("DATABASE_URL")) {
+  console.error("错误: 环境变量 DATABASE_URL 未设置。");
+  console.error("请设置连接到 Neon (Postgres) 的连接字符串。");
 } else {
   const port = 8000;
-  printBanner("0.0.0.0", port, "0.1.0", "Deno KV (kv-toolbox)");
+  printBanner("0.0.0.0", port, "0.2.0", "PostgreSQL (Neon)");
   
-  // 启动原生 Deno Http Server
   Deno.serve({ port, hostname: "0.0.0.0" }, app.fetch);
 }
