@@ -1,0 +1,14 @@
+{
+  "description": "一个简单、安全、自托管的 json 数据同步服务 (Deno 版)",
+  "tasks": {
+    "start": "deno run --allow-net --allow-env --unstable-kv main.ts",
+    "dev": "deno run --watch --allow-net --allow-env --unstable-kv main.ts"
+  },
+  "imports": {
+    "jsr:@kitsonk/kv-toolbox/blob": "jsr:@kitsonk/kv-toolbox@^0.11.0/blob"
+  },
+  "deploy": {
+    "entrypoint": "main.ts"
+  },
+  "unstable": ["kv"]
+}

@@ -2,11 +2,15 @@
 
 **本项目主要用于 SillyTavern 角色卡 《凡人修仙传》 云存档功能。**
 
-`Fanren Sync` 是一个基于 FastAPI 构建的简单、安全、可自托管的 JSON 数据同步服务。
+`Fanren Sync` 是一个简单、安全、可自托管的 JSON 数据同步服务。
+
+- **Python 版**: 基于 FastAPI 构建
+- **Deno 版**: 基于 Deno + Deno KV 构建 (用于 Deno Deploy)
 
 
 ## ✨ 功能特性
 
+**Python 版 (FastAPI)**
 - **安全认证**: 所有 API 请求都需要通过 URL 路径中包含的密码进行验证。
 - **简单易用**: 提供四个核心 API 端点 (`list`, `load`, `save`, `delete`)，轻松实现数据的增删改查。
 - **轻量高效**: 使用 FastAPI 构建，性能卓越，资源占用少。
@@ -16,18 +20,37 @@
   - 过滤存档名称，有效防止路径遍历攻击。
   - 根目录访问限制，保护服务不被随意探测。
 
+**Deno 版 (Deno Deploy)**
+- 所有 Python 版的 API 功能，保持完全兼容
+- 使用 Deno KV (Deno Database) 进行数据存储
+- 零配置持久化，数据自动保存
+- 原生支持 Deno Deploy 边缘部署
+- 无需 Docker，直接部署
+
 ## ⚡ 一键部署
 
 [![Deploy on Zeabur](https://zeabur.com/button.svg)](https://zeabur.com/templates/XQ9UAD)
 
+[![Deploy on Deno Deploy](https://deno.com/deno-deploy-button.svg)](https://dash.deno.com/new)
+
+Deno Deploy 部署说明：
+1. Fork 本仓库
+2. 在 [Deno Deploy](https://dash.deno.com/new) 中创建新项目
+3. 选择你的仓库，入口文件设置为 `main.ts`
+4. 在设置中添加环境变量 `SYNC_PASSWORD`
+
 ## 🚀 快速开始
 
-### 1. 环境准备
+---
+
+### Python 版 (FastAPI)
+
+#### 1. 环境准备
 
 - Python 3.8+
 - Git
 
-### 2. 安装
+#### 2. 安装
 
 ```bash
 # 克隆项目
@@ -38,7 +61,7 @@ cd fanren-sync
 pip install -r requirements.txt
 ```
 
-### 3. 配置
+#### 3. 配置
 
 我们提供了一个环境变量示例文件 `.env.example`。你需要将它复制一份，并重命名为 `.env`，然后修改里面的密码。
 
@@ -55,12 +78,52 @@ SYNC_PASSWORD=your_password
 ```
 **警告**: 请务必使用一个强大且随机的密码，不要使用默认密码。
 
-### 4. 运行 (开发环境)
+#### 4. 运行 (开发环境)
 
 ```bash
 python main.py
 ```
 服务将以开发模式启动在 `http://localhost:8000`。
+
+---
+
+### Deno 版 (用于 Deno Deploy)
+
+#### 1. 环境准备
+
+- Deno 1.40+
+- Git
+
+#### 2. 运行 (开发环境)
+
+```bash
+# 克隆项目
+git clone https://github.com/foamcold/fanren-sync
+cd fanren-sync
+
+# 设置密码并运行
+export SYNC_PASSWORD=your_password
+deno task start
+```
+
+或者使用开发模式（自动重载）：
+
+```bash
+export SYNC_PASSWORD=your_password
+deno task dev
+```
+
+服务将启动在 `http://localhost:8000`。
+
+#### 3. 部署到 Deno Deploy
+
+1. Fork 本仓库
+2. 访问 https://dash.deno.com/new
+3. 选择你的仓库，设置入口文件为 `main.ts`
+4. 在项目设置中添加环境变量 `SYNC_PASSWORD`
+5. 点击 "Deploy"
+
+Deno 版使用 Deno KV (Deno Database) 进行数据存储，无需额外配置持久化。
 
 ## 🐳 生产部署指南
 
