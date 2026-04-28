@@ -1,17 +1,14 @@
 import { Hono } from "npm:hono";
 import { cors } from "npm:hono/cors";
-import "jsr:@std/dotenv/load"; // 自动加载 .env 文件
-import pg from "npm:pg"; // 引入 PostgreSQL 官方客户端
+import "jsr:@std/dotenv/load"; 
+import pg from "npm:pg"; 
 
 // --- 配置 ---
 const syncPassword = Deno.env.get("SYNC_PASSWORD") || Deno.env.get("sync_password");
 
 // 初始化 PostgreSQL 连接池
-// Deno Deploy 会自动读取环境变量中的 DATABASE_URL，无需手动传参
-// 但为了兼容本地 .env 读取，我们显式传入
 const pool = new pg.Pool({
   connectionString: Deno.env.get("DATABASE_URL"),
-  // Neon Serverless 建议设置适当的超时，避免僵尸连接
   connectionTimeoutMillis: 5000, 
 });
 
@@ -19,7 +16,6 @@ const pool = new pg.Pool({
 async function initDB() {
   const client = await pool.connect();
   try {
-    // 自动创建 cloud_saves 表。利用 JSONB 类型容纳一切未知结构
     await client.query(`
       CREATE TABLE IF NOT EXISTS cloud_saves (
         id SERIAL PRIMARY KEY,
@@ -34,7 +30,6 @@ async function initDB() {
     client.release();
   }
 }
-// 启动时自动建表
 await initDB();
 
 // --- 应用实例 ---
@@ -70,22 +65,25 @@ app.use("*", cors({
 app.onError((err, c) => {
   console.error("服务器错误:", err);
   const status = (err as any).status || 500;
-  return c.json({ 
-    success: false, 
-    error: err.message || "服务器内部错误" 
-  }, status);
+  return c.json({ success: false, error: err.message || "服务器内部错误" }, status);
 });
 
-// --- 安全辅助函数 ---
+// --- 辅助函数 ---
 function sanitizeFilename(filename: string): string {
   const sanitized = filename.replace(/[^\p{L}\p{N}_\-]/gu, '');
   return sanitized.substring(0, 100);
 }
 
+// 生成时间后缀 (格式: 20260428_150531)
+function generateTimeSuffix(): string {
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+}
+
 // --- API 路由定义 ---
 const api = new Hono();
 
-// 密码验证依赖 (中间件)
 api.use("*", async (c, next) => {
   const password = c.req.param("password");
   if (!syncPassword || password !== syncPassword) {
@@ -97,7 +95,7 @@ api.use("*", async (c, next) => {
 // GET /list
 api.get("/list", async (c) => {
   try {
-    // 从数据库查出所有的存档名
+    // 按时间倒序返回，最新的版本会在最前面
     const result = await pool.query("SELECT archive_name FROM cloud_saves ORDER BY updated_at DESC");
     const archives = result.rows.map(row => row.archive_name);
     return c.json({ success: true, archives });
@@ -113,51 +111,52 @@ api.get("/load", async (c) => {
 
   const safeFilename = sanitizeFilename(archiveName);
   try {
-    // 根据存档名查找 JSONB 数据
     const result = await pool.query("SELECT data FROM cloud_saves WHERE archive_name = $1", [safeFilename]);
-    
-    if (result.rowCount === 0) {
-      return c.json({ success: false, error: "存档未找到" }, 404);
-    }
-    
-    // pg 驱动会自动将 JSONB 字段解析为 JavaScript 对象，直接返回即可
+    if (result.rowCount === 0) return c.json({ success: false, error: "存档未找到" }, 404);
     return c.json({ success: true, data: result.rows[0].data });
   } catch (e: any) {
     return c.json({ success: false, error: `无法加载存档: ${e.message}` }, 500);
   }
 });
 
-// POST /save
+// POST /save (核心修改：版本控制与重复检查)
 api.post("/save", async (c) => {
   try {
     const payload = await c.req.json();
-    let archiveName = payload.archiveName;
+    let baseArchiveName = payload.archiveName;
     
-    if (!archiveName && payload.data && typeof payload.data === "object") {
-      archiveName = payload.data._internalName;
+    if (!baseArchiveName && payload.data && typeof payload.data === "object") {
+      baseArchiveName = payload.data._internalName;
     }
-    
-    if (!archiveName) {
-      return c.json({ 
-        success: false, 
-        error: "Archive name is required (in body 'archiveName' or 'data._internalName')" 
-      }, 400);
+    if (!baseArchiveName) {
+      return c.json({ success: false, error: "Archive name is required" }, 400);
     }
 
-    const safeFilename = sanitizeFilename(archiveName);
-    console.log(`正在保存存档: 原始名称='${archiveName}', 安全名称='${safeFilename}'`);
+    const safeBaseName = sanitizeFilename(baseArchiveName);
+    const timeSuffix = generateTimeSuffix();
+    let finalArchiveName = `${safeBaseName}_${timeSuffix}`; // 例如: player1_20260428_150531
+    
+    // --- 检查重复循环 ---
+    // 如果该名字已存在（同一秒内发起了多次保存），则追加 _1, _2 等后缀
+    let counter = 1;
+    while (true) {
+      const checkRes = await pool.query("SELECT id FROM cloud_saves WHERE archive_name = $1", [finalArchiveName]);
+      if (checkRes.rowCount === 0) {
+        break; // 名字唯一，跳出循环
+      }
+      finalArchiveName = `${safeBaseName}_${timeSuffix}_${counter}`;
+      counter++;
+    }
 
-    // 使用 Postgres 的 UPSERT 语法：有则更新，无则插入
-    // 注意：pg 驱动会自动将 payload.data 序列化存入 JSONB 字段
+    console.log(`正在保存版本化存档: 基础名称='${safeBaseName}', 最终名称='${finalArchiveName}'`);
+
+    // 此时名字绝对唯一，直接 INSERT 即可，不再需要 ON CONFLICT 覆盖
     await pool.query(
-      `INSERT INTO cloud_saves (archive_name, data) 
-       VALUES ($1, $2) 
-       ON CONFLICT (archive_name) 
-       DO UPDATE SET data = EXCLUDED.data, updated_at = CURRENT_TIMESTAMP`,
-      [safeFilename, payload.data]
+      `INSERT INTO cloud_saves (archive_name, data) VALUES ($1, $2)`,
+      [finalArchiveName, payload.data]
     );
     
-    return c.json({ success: true, message: "存档已成功保存" });
+    return c.json({ success: true, message: "存档新版本已成功保存", savedName: finalArchiveName });
   } catch (e: any) {
     console.error("保存存档失败:", e);
     return c.json({ success: false, error: `无法保存存档: ${e.message}` }, 500);
@@ -172,11 +171,7 @@ api.delete("/delete", async (c) => {
   const safeFilename = sanitizeFilename(archiveName);
   try {
     const result = await pool.query("DELETE FROM cloud_saves WHERE archive_name = $1", [safeFilename]);
-    
-    if (result.rowCount === 0) {
-      return c.json({ success: false, error: "存档未找到" }, 404);
-    }
-
+    if (result.rowCount === 0) return c.json({ success: false, error: "存档未找到" }, 404);
     return c.json({ success: true, message: "存档已成功删除" });
   } catch (e: any) {
     return c.json({ success: false, error: `无法删除存档: ${e.message}` }, 500);
@@ -185,55 +180,14 @@ api.delete("/delete", async (c) => {
 
 // --- 全局路由 ---
 app.get("/favicon.ico", () => new Response(null, { status: 204 }));
-
-app.get("/", (c) => {
-  return c.json({
-    success: true,
-    message: "Fanren Sync 服务正在运行。请使用正确的 API 路径和密码进行访问。",
-  }, 200);
-});
-
-// 挂载密码保护的路由
+app.get("/", (c) => c.json({ success: true, message: "Fanren Sync 运行中 (Postgres版本控制生效中)" }, 200));
 app.route("/:password/api", api);
 
-// --- 横幅打印 ---
-function printBanner(host: string, port: number, version: string, storageMode: string) {
-  const contentLines = [
-    `Fanren-Sync v${version} 启动成功`,
-    ``,
-    `数据存储: ${storageMode}`,
-    `服务地址: http://${host === "0.0.0.0" ? "localhost" : host}:${port}`
-  ];
-
-  const getWidth = (s: string) => s.split('').reduce((acc, c) => acc + (c.match(/[\u4e00-\u9fff]/) ? 2 : 1), 0);
-  
-  let maxWidth = 40;
-  for (const line of contentLines) maxWidth = Math.max(maxWidth, getWidth(line));
-  const boxWidth = maxWidth + 4;
-
-  console.log(`┌${'─'.repeat(boxWidth)}┐`);
-  for (const line of contentLines) {
-    const padding = boxWidth - getWidth(line);
-    if (line.includes("启动成功")) {
-      const leftPad = Math.floor(padding / 2);
-      console.log(`│${' '.repeat(leftPad)}${line}${' '.repeat(padding - leftPad)}│`);
-    } else {
-      console.log(`│  ${line}${' '.repeat(padding - 2)}│`);
-    }
-  }
-  console.log(`└${'─'.repeat(boxWidth)}┘`);
-}
-
 // --- 服务启动 ---
-if (!syncPassword) {
-  console.error("错误: 环境变量 SYNC_PASSWORD 未设置。");
-  console.error("请在项目根目录创建一个 .env 文件并设置 SYNC_PASSWORD。");
-} else if (!Deno.env.get("DATABASE_URL")) {
-  console.error("错误: 环境变量 DATABASE_URL 未设置。");
-  console.error("请设置连接到 Neon (Postgres) 的连接字符串。");
+if (!syncPassword || !Deno.env.get("DATABASE_URL")) {
+  console.error("错误: 请确保设置了 SYNC_PASSWORD 和 DATABASE_URL 环境变量。");
 } else {
   const port = 8000;
-  printBanner("0.0.0.0", port, "0.2.0", "PostgreSQL (Neon)");
-  
+  console.log(`🚀 Fanren-Sync v0.3.0 (Postgres Versioned) 启动于端口 ${port}`);
   Deno.serve({ port, hostname: "0.0.0.0" }, app.fetch);
 }
