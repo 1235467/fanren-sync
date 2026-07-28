@@ -79,14 +79,25 @@ async function initDB() {
     `, [POLLUTION_PATTERN]);
 
     await client.query("COMMIT");
+    console.log("数据库初始化/迁移完成");
   } catch (err) {
-    await client.query("ROLLBACK").catch(() => {});
+    if (client) await client.query("ROLLBACK").catch(() => {});
     console.error("初始化数据库失败:", err);
+    throw err; // 抛出以便 ensureDB 标记失败、下次请求重试
   } finally {
-    client.release();
+    if (client) client.release();
   }
 }
-await initDB();
+
+// 每个 isolate 只初始化一次; 失败则重置, 允许后续请求重试
+let dbInitPromise: Promise<void> | null = null;
+function ensureDB(): Promise<void> {
+  if (!dbInitPromise) {
+    dbInitPromise = initDB();
+    dbInitPromise.catch(() => { dbInitPromise = null; });
+  }
+  return dbInitPromise;
+}
 
 // --- 应用实例 ---
 const app = new Hono();
@@ -137,6 +148,11 @@ api.use("*", async (c, next) => {
   const password = c.req.param("password");
   if (!syncPassword || password !== syncPassword) {
     return c.json({ success: false, error: "无效的访问密码" }, 403);
+  }
+  try {
+    await ensureDB();
+  } catch (e: any) {
+    return c.json({ success: false, error: `数据库不可用: ${e.message}` }, 503);
   }
   await next();
 });
@@ -350,6 +366,7 @@ app.get("/:password/", (c) => c.redirect(`/${c.req.param("password")}`, 301));
 app.get("/:password", async (c) => {
   const denied = checkPagePassword(c);
   if (denied) return denied;
+  try { await ensureDB(); } catch (e: any) { return c.html(`<h1>503</h1><p>数据库不可用: ${escapeHtml(e.message)}</p>`, 503); }
   try {
     const result = await pool.query(`
       SELECT s.archive_name, s.updated_at,
@@ -382,6 +399,7 @@ app.get("/:password", async (c) => {
 app.get("/:password/versions", async (c) => {
   const denied = checkPagePassword(c);
   if (denied) return denied;
+  try { await ensureDB(); } catch (e: any) { return c.html(`<h1>503</h1><p>数据库不可用: ${escapeHtml(e.message)}</p>`, 503); }
   const name = c.req.query("name");
   if (!name) return c.html('<h1>400</h1><p>缺少 name 参数</p>', 400);
   try {
@@ -418,6 +436,7 @@ app.get("/:password/versions", async (c) => {
 app.get("/:password/view", async (c) => {
   const denied = checkPagePassword(c);
   if (denied) return denied;
+  try { await ensureDB(); } catch (e: any) { return c.html(`<h1>503</h1><p>数据库不可用: ${escapeHtml(e.message)}</p>`, 503); }
   const name = c.req.query("name");
   if (!name) return c.html('<h1>400</h1><p>缺少 name 参数</p>', 400);
   try {
@@ -439,6 +458,7 @@ app.get("/:password/view", async (c) => {
 app.get("/:password/view_version", async (c) => {
   const denied = checkPagePassword(c);
   if (denied) return denied;
+  try { await ensureDB(); } catch (e: any) { return c.html(`<h1>503</h1><p>数据库不可用: ${escapeHtml(e.message)}</p>`, 503); }
   const id = c.req.query("id");
   if (!id || !/^[0-9]+$/.test(id)) return c.html('<h1>400</h1><p>缺少或非法的 id 参数</p>', 400);
   try {
@@ -467,6 +487,7 @@ app.get("/:password/view_version", async (c) => {
 app.post("/:password/rollback", async (c) => {
   const denied = checkPagePassword(c);
   if (denied) return denied;
+  try { await ensureDB(); } catch (e: any) { return c.html(`<h1>503</h1><p>数据库不可用: ${escapeHtml(e.message)}</p>`, 503); }
   const body = await c.req.parseBody();
   const id = String(body["id"] || "");
   if (!/^[0-9]+$/.test(id)) return c.html('<h1>400</h1><p>非法的版本 id</p>', 400);
@@ -517,6 +538,7 @@ app.post("/:password/rollback", async (c) => {
 app.post("/:password/delete_archive", async (c) => {
   const denied = checkPagePassword(c);
   if (denied) return denied;
+  try { await ensureDB(); } catch (e: any) { return c.html(`<h1>503</h1><p>数据库不可用: ${escapeHtml(e.message)}</p>`, 503); }
   const body = await c.req.parseBody();
   const name = String(body["name"] || "");
   if (!name) return c.html('<h1>400</h1><p>缺少 name 参数</p>', 400);
@@ -542,6 +564,7 @@ app.post("/:password/delete_archive", async (c) => {
 app.post("/:password/delete_version", async (c) => {
   const denied = checkPagePassword(c);
   if (denied) return denied;
+  try { await ensureDB(); } catch (e: any) { return c.html(`<h1>503</h1><p>数据库不可用: ${escapeHtml(e.message)}</p>`, 503); }
   const body = await c.req.parseBody();
   const id = String(body["id"] || "");
   if (!/^[0-9]+$/.test(id)) return c.html('<h1>400</h1><p>非法的版本 id</p>', 400);
@@ -564,10 +587,14 @@ app.get("/", (c) => c.json({ success: true, message: "Fanren Sync 运行中 (Pos
 app.route("/:password/api", api);
 
 // --- 服务启动 ---
-if (!syncPassword || !Deno.env.get("DATABASE_URL")) {
-  console.error("错误: 请确保设置了 SYNC_PASSWORD 和 DATABASE_URL 环境变量。");
-} else {
-  const port = 8000;
-  console.log(`🚀 Fanren-Sync v0.4.0 (Postgres Latest+Versions) 启动于端口 ${port}`);
-  Deno.serve({ port, hostname: "0.0.0.0" }, app.fetch);
+// 无条件启动: Deno Deploy 的 Warm up 阶段环境变量可能尚未注入,
+// 若此时拒绝启动会导致整个部署失败; 缺配置时 API/网页会各自返回 403/503。
+if (!syncPassword) {
+  console.error("警告: SYNC_PASSWORD 未设置, 所有 API 和网页将返回 403。");
 }
+if (!Deno.env.get("DATABASE_URL") && !Deno.env.get("PGHOST")) {
+  console.error("警告: DATABASE_URL 未设置, 数据库将在首次请求时按 pg 默认环境变量连接。");
+}
+const port = 8000;
+console.log(`🚀 Fanren-Sync v0.4.1 (Postgres Latest+Versions) 启动于端口 ${port}`);
+Deno.serve({ port, hostname: "0.0.0.0" }, app.fetch);
