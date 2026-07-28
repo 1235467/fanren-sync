@@ -140,7 +140,7 @@ api.use("*", async (c, next) => {
 api.get("/list", async (c) => {
   try {
     const result = await pool.query("SELECT archive_name FROM cloud_saves ORDER BY updated_at DESC");
-    const archives = result.rows.map(row => row.archive_name);
+    const archives = result.rows.map((row: any) => row.archive_name);
     return c.json({ success: true, archives });
   } catch (e: any) {
     return c.json({ success: false, error: `无法列出存档: ${e.message}` }, 500);
@@ -272,6 +272,284 @@ api.delete("/delete", async (c) => {
     return c.json({ success: false, error: `无法删除存档: ${e.message}` }, 500);
   } finally {
     if (client) client.release();
+  }
+});
+
+// --- 版本管理网页 (与 API 同密码路径, 供浏览器直接访问) ---
+function escapeHtml(s: unknown): string {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// 清理对话正文: 数据本身已是卡片 regex 清理后的 HTML, 这里再去掉残留的结构标签和危险内容
+function sanitizeStoryHtml(html: unknown): string {
+  return String(html ?? '')
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<(iframe|object|embed|style)[\s\S]*?<\/\1>/gi, '')
+    .replace(/<\/?story_(plot|body)[^>]*>/gi, '')
+    .replace(/\son\w+\s*=\s*"[^"]*"/gi, '')
+    .replace(/\son\w+\s*=\s*'[^']*'/gi, '');
+}
+
+function pageHead(title: string): string {
+  return `<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escapeHtml(title)} - Fanren Sync</title>
+<style>
+body{font-family:system-ui,-apple-system,sans-serif;max-width:760px;margin:0 auto;padding:16px 20px;color:#222;line-height:1.7}
+h1{font-size:1.25rem;margin:8px 0}
+a{color:#2563eb;text-decoration:none}a:hover{text-decoration:underline}
+table{border-collapse:collapse;width:100%;margin:12px 0}
+td,th{border-bottom:1px solid #e5e5e5;padding:6px 8px;text-align:left;font-size:.92rem}
+.msg{border:1px solid #e0e0e0;border-radius:8px;padding:10px 14px;margin:12px 0;white-space:pre-wrap;word-break:break-word}
+.msg.user{background:#f4f8ff}
+.who{font-size:.78rem;color:#777;margin-bottom:6px}
+button{padding:3px 12px;cursor:pointer}
+.banner{background:#fff8e6;border:1px solid #f0e0b0;border-radius:8px;padding:8px 14px;margin:12px 0;font-size:.9rem}
+.muted{color:#777;font-size:.85rem}
+</style></head><body>`;
+}
+
+// 渲染一份存档数据的完整对话
+function renderConversation(data: any): string {
+  const logs = Array.isArray(data?.logs) ? data.logs : [];
+  const parts: string[] = [];
+  let shown = 0;
+  for (const log of logs) {
+    if (!log || typeof log.content !== 'string' || !log.content.trim()) continue;
+    const who = log.type === 'user' ? '玩家' : 'AI';
+    const time = String(log.timestamp || '').replace('T', ' ').slice(0, 16);
+    parts.push(
+      `<div class="msg${log.type === 'user' ? ' user' : ''}">` +
+      `<div class="who">${who}${time ? ' · ' + escapeHtml(time) : ''}</div>` +
+      `<div>${sanitizeStoryHtml(log.content)}</div></div>`
+    );
+    shown++;
+  }
+  if (shown === 0) return '<p class="muted">（此存档中没有对话记录）</p>';
+  return `<p class="muted">共 ${shown} 条对话</p>` + parts.join('\n');
+}
+
+// 网页密码校验: 失败时返回 403 页面
+function checkPagePassword(c: any): Response | null {
+  if (!syncPassword || c.req.param("password") !== syncPassword) {
+    return c.html('<h1>403</h1><p>无效的访问密码</p>', 403);
+  }
+  return null;
+}
+
+// 带尾斜杠时重定向, 避免手动输入 URL 404
+app.get("/:password/", (c) => c.redirect(`/${c.req.param("password")}`, 301));
+
+// GET /:password — 存档总览
+app.get("/:password", async (c) => {
+  const denied = checkPagePassword(c);
+  if (denied) return denied;
+  try {
+    const result = await pool.query(`
+      SELECT s.archive_name, s.updated_at,
+             COALESCE(jsonb_array_length(s.data->'logs'), 0) AS log_count,
+             (SELECT count(*) FROM cloud_save_versions v WHERE v.archive_name = s.archive_name) AS version_count
+      FROM cloud_saves s ORDER BY s.updated_at DESC
+    `);
+    const pw = encodeURIComponent(c.req.param("password")!);
+    const rows = result.rows.map((r: any) => {
+      const name = encodeURIComponent(r.archive_name);
+      return `<tr><td>${escapeHtml(r.archive_name)}</td>` +
+        `<td>${new Date(r.updated_at).toLocaleString('zh-CN', { hour12: false })}</td>` +
+        `<td>${r.log_count}</td><td>${r.version_count}</td>` +
+        `<td><a href="/${pw}/view?name=${name}">查看当前</a> · <a href="/${pw}/versions?name=${name}">历史版本</a></td>` +
+        `<td><form method="post" action="/${pw}/delete_archive" style="display:inline" onsubmit="return confirm('确定删除存档「${escapeHtml(r.archive_name)}」吗？其全部历史版本也会一并删除，不可恢复。')">` +
+        `<input type="hidden" name="name" value="${escapeHtml(r.archive_name)}"><button>删除</button></form></td></tr>`;
+    }).join('\n');
+    return c.html(pageHead('存档总览') +
+      `<h1>云存档总览</h1>` +
+      (rows
+        ? `<table><tr><th>存档</th><th>更新时间</th><th>对话数</th><th>历史版本</th><th>操作</th><th>删除</th></tr>${rows}</table>`
+        : '<p class="muted">暂无存档</p>') +
+      `</body></html>`);
+  } catch (e: any) {
+    return c.html(`<h1>错误</h1><p>${escapeHtml(e.message)}</p>`, 500);
+  }
+});
+
+// GET /:password/versions?name= — 一个存档的历史版本列表
+app.get("/:password/versions", async (c) => {
+  const denied = checkPagePassword(c);
+  if (denied) return denied;
+  const name = c.req.query("name");
+  if (!name) return c.html('<h1>400</h1><p>缺少 name 参数</p>', 400);
+  try {
+    const result = await pool.query(
+      `SELECT id, created_at, COALESCE(jsonb_array_length(data->'logs'), 0) AS log_count
+       FROM cloud_save_versions WHERE archive_name = $1 ORDER BY id DESC`,
+      [name]
+    );
+    const pw = encodeURIComponent(c.req.param("password")!);
+    const encName = encodeURIComponent(name);
+    const rows = result.rows.map((r: any, i: number) =>
+      `<tr><td>#${r.id} <span class="muted">(倒数第 ${i + 1} 版)</span></td>` +
+      `<td>${new Date(r.created_at).toLocaleString('zh-CN', { hour12: false })}</td>` +
+      `<td>${r.log_count}</td>` +
+      `<td><a href="/${pw}/view_version?id=${r.id}">查看对话</a></td>` +
+      `<td><form method="post" action="/${pw}/rollback" style="display:inline" onsubmit="return confirm('确定回滚到此版本吗？不会删除任何历史版本，当前内容也会保留为一条新版本。')">` +
+      `<input type="hidden" name="id" value="${r.id}"><button>回滚</button></form></td>` +
+      `<td><form method="post" action="/${pw}/delete_version" style="display:inline" onsubmit="return confirm('确定删除这个历史版本吗？不可恢复。')">` +
+      `<input type="hidden" name="id" value="${r.id}"><button>删除</button></form></td></tr>`
+    ).join('\n');
+    return c.html(pageHead(`历史版本 - ${name}`) +
+      `<p><a href="/${pw}">← 返回总览</a></p><h1>${escapeHtml(name)}</h1>` +
+      `<p><a href="/${pw}/view?name=${encName}">查看当前最新版本</a></p>` +
+      (rows
+        ? `<table><tr><th>版本</th><th>保存时间</th><th>对话数</th><th>对话</th><th>回滚</th><th>删除</th></tr>${rows}</table>`
+        : '<p class="muted">暂无历史版本</p>') +
+      `</body></html>`);
+  } catch (e: any) {
+    return c.html(`<h1>错误</h1><p>${escapeHtml(e.message)}</p>`, 500);
+  }
+});
+
+// GET /:password/view?name= — 查看当前最新版本的对话
+app.get("/:password/view", async (c) => {
+  const denied = checkPagePassword(c);
+  if (denied) return denied;
+  const name = c.req.query("name");
+  if (!name) return c.html('<h1>400</h1><p>缺少 name 参数</p>', 400);
+  try {
+    const result = await pool.query("SELECT data FROM cloud_saves WHERE archive_name = $1", [name]);
+    if (result.rowCount === 0) return c.html('<h1>404</h1><p>存档未找到</p>', 404);
+    const pw = encodeURIComponent(c.req.param("password")!);
+    const data = result.rows[0].data;
+    const title = data?._internalName || name;
+    return c.html(pageHead(`${title} - 当前版本`) +
+      `<p><a href="/${pw}/versions?name=${encodeURIComponent(name)}">← 返回版本列表</a></p>` +
+      `<h1>${escapeHtml(title)} <span class="muted">(当前最新)</span></h1>` +
+      renderConversation(data) + `</body></html>`);
+  } catch (e: any) {
+    return c.html(`<h1>错误</h1><p>${escapeHtml(e.message)}</p>`, 500);
+  }
+});
+
+// GET /:password/view_version?id= — 查看某个历史版本的对话
+app.get("/:password/view_version", async (c) => {
+  const denied = checkPagePassword(c);
+  if (denied) return denied;
+  const id = c.req.query("id");
+  if (!id || !/^[0-9]+$/.test(id)) return c.html('<h1>400</h1><p>缺少或非法的 id 参数</p>', 400);
+  try {
+    const result = await pool.query(
+      "SELECT archive_name, data, created_at FROM cloud_save_versions WHERE id = $1", [Number(id)]
+    );
+    if (result.rowCount === 0) return c.html('<h1>404</h1><p>版本未找到</p>', 404);
+    const pw = encodeURIComponent(c.req.param("password")!);
+    const row = result.rows[0];
+    const data = row.data;
+    const title = data?._internalName || row.archive_name;
+    const time = new Date(row.created_at).toLocaleString('zh-CN', { hour12: false });
+    return c.html(pageHead(`${title} - 版本 #${id}`) +
+      `<p><a href="/${pw}/versions?name=${encodeURIComponent(row.archive_name)}">← 返回版本列表</a></p>` +
+      `<h1>${escapeHtml(title)}</h1>` +
+      `<div class="banner">这是历史版本 #${id}，保存于 ${time}。` +
+      `<form method="post" action="/${pw}/rollback" style="display:inline" onsubmit="return confirm('确定回滚到此版本吗？')">` +
+      `<input type="hidden" name="id" value="${id}"> <button>回滚到此版本</button></form></div>` +
+      renderConversation(data) + `</body></html>`);
+  } catch (e: any) {
+    return c.html(`<h1>错误</h1><p>${escapeHtml(e.message)}</p>`, 500);
+  }
+});
+
+// POST /:password/rollback — 把指定历史版本恢复为当前最新 (原最新内容保留为新的历史版本)
+app.post("/:password/rollback", async (c) => {
+  const denied = checkPagePassword(c);
+  if (denied) return denied;
+  const body = await c.req.parseBody();
+  const id = String(body["id"] || "");
+  if (!/^[0-9]+$/.test(id)) return c.html('<h1>400</h1><p>非法的版本 id</p>', 400);
+
+  let client;
+  try {
+    client = await pool.connect();
+    await client.query("BEGIN");
+    const vres = await client.query(
+      "SELECT archive_name, data FROM cloud_save_versions WHERE id = $1", [Number(id)]
+    );
+    if (vres.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return c.html('<h1>404</h1><p>版本未找到</p>', 404);
+    }
+    const { archive_name, data } = vres.rows[0];
+
+    // 1) 目标版本覆盖为当前最新
+    await client.query(
+      `INSERT INTO cloud_saves (archive_name, data) VALUES ($1, $2)
+       ON CONFLICT (archive_name) DO UPDATE SET data = EXCLUDED.data, updated_at = CURRENT_TIMESTAMP`,
+      [archive_name, data]
+    );
+    // 2) 这次回滚本身也记为一条历史版本, 保证历史连续
+    await client.query(
+      `INSERT INTO cloud_save_versions (archive_name, data) VALUES ($1, $2)`,
+      [archive_name, data]
+    );
+    // 3) 裁剪
+    await client.query(
+      `DELETE FROM cloud_save_versions WHERE archive_name = $1 AND id NOT IN (
+         SELECT id FROM cloud_save_versions WHERE archive_name = $1 ORDER BY id DESC LIMIT $2)`,
+      [archive_name, MAX_VERSIONS]
+    );
+    await client.query("COMMIT");
+
+    const pw = encodeURIComponent(c.req.param("password")!);
+    return c.redirect(`/${pw}/versions?name=${encodeURIComponent(archive_name)}`, 303);
+  } catch (e: any) {
+    if (client) await client.query("ROLLBACK").catch(() => {});
+    return c.html(`<h1>错误</h1><p>${escapeHtml(e.message)}</p>`, 500);
+  } finally {
+    if (client) client.release();
+  }
+});
+
+// POST /:password/delete_archive — 网页上手动删除整个存档 (含全部历史版本)
+app.post("/:password/delete_archive", async (c) => {
+  const denied = checkPagePassword(c);
+  if (denied) return denied;
+  const body = await c.req.parseBody();
+  const name = String(body["name"] || "");
+  if (!name) return c.html('<h1>400</h1><p>缺少 name 参数</p>', 400);
+
+  let client;
+  try {
+    client = await pool.connect();
+    await client.query("BEGIN");
+    await client.query("DELETE FROM cloud_saves WHERE archive_name = $1", [name]);
+    await client.query("DELETE FROM cloud_save_versions WHERE archive_name = $1", [name]);
+    await client.query("COMMIT");
+    const pw = encodeURIComponent(c.req.param("password")!);
+    return c.redirect(`/${pw}`, 303);
+  } catch (e: any) {
+    if (client) await client.query("ROLLBACK").catch(() => {});
+    return c.html(`<h1>错误</h1><p>${escapeHtml(e.message)}</p>`, 500);
+  } finally {
+    if (client) client.release();
+  }
+});
+
+// POST /:password/delete_version — 网页上手动删除单个历史版本
+app.post("/:password/delete_version", async (c) => {
+  const denied = checkPagePassword(c);
+  if (denied) return denied;
+  const body = await c.req.parseBody();
+  const id = String(body["id"] || "");
+  if (!/^[0-9]+$/.test(id)) return c.html('<h1>400</h1><p>非法的版本 id</p>', 400);
+
+  try {
+    const result = await pool.query(
+      "DELETE FROM cloud_save_versions WHERE id = $1 RETURNING archive_name", [Number(id)]
+    );
+    if (result.rowCount === 0) return c.html('<h1>404</h1><p>版本未找到</p>', 404);
+    const pw = encodeURIComponent(c.req.param("password")!);
+    return c.redirect(`/${pw}/versions?name=${encodeURIComponent(result.rows[0].archive_name)}`, 303);
+  } catch (e: any) {
+    return c.html(`<h1>错误</h1><p>${escapeHtml(e.message)}</p>`, 500);
   }
 });
 

@@ -284,3 +284,56 @@ docker-compose up -d
     "message": "存档已成功删除"
   }
   ```
+- *(注：会同时删除该存档的全部历史版本)*
+
+---
+
+### 列出存档的历史版本
+
+存档采用「同名覆盖」：主表始终是该名字的最新数据。每次保存会同时在版本表中追加一条历史版本（每个存档最多保留最近 30 版），对客户端透明。
+
+- **方法**: `GET`
+- **路径**: `/api/versions`
+- **参数**: `archiveName` (Query String)
+- **示例**: `GET http://localhost:8000/your_password/api/versions?archiveName=test_data_1`
+- **成功响应**:
+  ```json
+  {
+    "success": true,
+    "versions": [
+      { "id": 12, "created_at": "2026-07-28T04:39:03.248Z" },
+      { "id": 11, "created_at": "2026-07-28T04:30:00.000Z" }
+    ]
+  }
+  ```
+
+---
+
+### 加载历史版本
+
+- **方法**: `GET`
+- **路径**: `/api/load_version`
+- **参数**: `id` (Query String，来自 `/api/versions` 返回的版本 id)
+- **示例**: `GET http://localhost:8000/your_password/api/load_version?id=11`
+- **成功响应**:
+  ```json
+  {
+    "success": true,
+    "archiveName": "test_data_1",
+    "createdAt": "2026-07-28T04:30:00.000Z",
+    "data": { "key": "old value" }
+  }
+  ```
+
+---
+
+## 🖥️ 版本管理网页
+
+浏览器直接访问 `http://<your-host>:<port>/<your-password>` 即可打开版本管理页（与 API 同一密码）：
+
+- **存档总览**：列出所有云存档（更新时间、对话数、历史版本数），可删除整个存档
+- **历史版本**：列出某存档的全部历史版本，可查看任意版本的完整对话（玩家/AI 逐条展示，正文为卡片 regex 清理后的内容）
+- **回滚**：一键把任意历史版本恢复为当前最新；回滚不会删除任何历史版本，原最新内容也会保留为一条新版本
+- **删除**：可单独删除某个历史版本
+
+角色卡无需任何修改：回滚后在卡片里正常加载同名存档，即为旧版本内容。
