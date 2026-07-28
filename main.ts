@@ -12,15 +12,20 @@ const MAX_VERSIONS = 30;
 const POLLUTION_PATTERN = "_[0-9]{8}_[0-9]{6}(_[0-9]+)?$";
 
 // 初始化 PostgreSQL 连接池
+// 不传 connectionString 时 pg 会自动读取 PGHOST/PGUSER/PGPASSWORD/PGDATABASE 等环境变量
+// (兼容 Deno Deploy 托管 PostgreSQL 的注入方式)
 const pool = new pg.Pool({
-  connectionString: Deno.env.get("DATABASE_URL"),
+  ...(Deno.env.get("DATABASE_URL") ? { connectionString: Deno.env.get("DATABASE_URL") } : {}),
   connectionTimeoutMillis: 5000, 
 });
 
-// --- 初始化数据库表 ---
+// --- 初始化数据库表 (惰性: 首次请求时才执行) ---
+// Deno Deploy 的 Warm up 阶段没有数据库环境变量和网络, 顶层连接会导致部署失败,
+// 所以这里绝不在模块加载时调用, 而是由 ensureDB 在首个请求到来时触发。
 async function initDB() {
-  const client = await pool.connect();
+  let client;
   try {
+    client = await pool.connect();
     await client.query("BEGIN");
 
     // 主表: 每个存档一行, 同名覆盖 (与旧版 main.py 的文件行为一致)
