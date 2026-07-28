@@ -5,6 +5,11 @@ import pg from "npm:pg";
 
 // --- 配置 ---
 const syncPassword = Deno.env.get("SYNC_PASSWORD") || Deno.env.get("sync_password");
+// 每个存档最多保留的历史版本数
+const MAX_VERSIONS = 30;
+// 3f870fd 版本控制产生的污染行后缀特征: name_20260428_150531 / name_20260428_150531_1
+// 注意: Postgres POSIX 正则不支持 \d, 必须用 [0-9]
+const POLLUTION_PATTERN = "_[0-9]{8}_[0-9]{6}(_[0-9]+)?$";
 
 // 初始化 PostgreSQL 连接池
 const pool = new pg.Pool({
@@ -16,6 +21,9 @@ const pool = new pg.Pool({
 async function initDB() {
   const client = await pool.connect();
   try {
+    await client.query("BEGIN");
+
+    // 主表: 每个存档一行, 同名覆盖 (与旧版 main.py 的文件行为一致)
     await client.query(`
       CREATE TABLE IF NOT EXISTS cloud_saves (
         id SERIAL PRIMARY KEY,
@@ -24,7 +32,50 @@ async function initDB() {
         updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
     `);
+
+    // 版本表: 每次保存追加一条历史版本, 对卡片透明
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS cloud_save_versions (
+        id SERIAL PRIMARY KEY,
+        archive_name TEXT NOT NULL,
+        data JSONB NOT NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_versions_name ON cloud_save_versions (archive_name, id DESC);
+    `);
+
+    // --- 一次性迁移: 清理 3f870fd 产生的带时间后缀的污染行 (幂等) ---
+    // 1) 将污染行导入版本表 (基础名去掉时间后缀)
+    await client.query(`
+      INSERT INTO cloud_save_versions (archive_name, data, created_at)
+      SELECT regexp_replace(archive_name, $1, ''), data, updated_at
+      FROM cloud_saves
+      WHERE archive_name ~ $1;
+    `, [POLLUTION_PATTERN]);
+
+    // 2) 若基础名在主表不存在, 用该存档最新的一个污染行恢复为主表行
+    await client.query(`
+      INSERT INTO cloud_saves (archive_name, data, updated_at)
+      SELECT DISTINCT ON (base) base, data, updated_at
+      FROM (
+        SELECT regexp_replace(archive_name, $1, '') AS base, data, updated_at
+        FROM cloud_saves
+        WHERE archive_name ~ $1
+      ) t
+      ORDER BY base, updated_at DESC
+      ON CONFLICT (archive_name) DO NOTHING;
+    `, [POLLUTION_PATTERN]);
+
+    // 3) 数据已安全复制, 删除污染行
+    await client.query(`
+      DELETE FROM cloud_saves WHERE archive_name ~ $1;
+    `, [POLLUTION_PATTERN]);
+
+    await client.query("COMMIT");
   } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
     console.error("初始化数据库失败:", err);
   } finally {
     client.release();
@@ -74,13 +125,6 @@ function sanitizeFilename(filename: string): string {
   return sanitized.substring(0, 100);
 }
 
-// 生成时间后缀 (格式: 20260428_150531)
-function generateTimeSuffix(): string {
-  const now = new Date();
-  const pad = (n: number) => String(n).padStart(2, '0');
-  return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-}
-
 // --- API 路由定义 ---
 const api = new Hono();
 
@@ -95,7 +139,6 @@ api.use("*", async (c, next) => {
 // GET /list
 api.get("/list", async (c) => {
   try {
-    // 按时间倒序返回，最新的版本会在最前面
     const result = await pool.query("SELECT archive_name FROM cloud_saves ORDER BY updated_at DESC");
     const archives = result.rows.map(row => row.archive_name);
     return c.json({ success: true, archives });
@@ -119,68 +162,122 @@ api.get("/load", async (c) => {
   }
 });
 
-// POST /save (核心修改：版本控制与重复检查)
+// POST /save (同名覆盖主表 + 追加历史版本, 一个事务)
 api.post("/save", async (c) => {
+  let client;
   try {
     const payload = await c.req.json();
-    let baseArchiveName = payload.archiveName;
+    let archiveName = payload.archiveName;
     
-    if (!baseArchiveName && payload.data && typeof payload.data === "object") {
-      baseArchiveName = payload.data._internalName;
+    if (!archiveName && payload.data && typeof payload.data === "object") {
+      archiveName = payload.data._internalName;
     }
-    if (!baseArchiveName) {
+    if (!archiveName) {
       return c.json({ success: false, error: "Archive name is required" }, 400);
     }
 
-    const safeBaseName = sanitizeFilename(baseArchiveName);
-    const timeSuffix = generateTimeSuffix();
-    let finalArchiveName = `${safeBaseName}_${timeSuffix}`; // 例如: player1_20260428_150531
-    
-    // --- 检查重复循环 ---
-    // 如果该名字已存在（同一秒内发起了多次保存），则追加 _1, _2 等后缀
-    let counter = 1;
-    while (true) {
-      const checkRes = await pool.query("SELECT id FROM cloud_saves WHERE archive_name = $1", [finalArchiveName]);
-      if (checkRes.rowCount === 0) {
-        break; // 名字唯一，跳出循环
-      }
-      finalArchiveName = `${safeBaseName}_${timeSuffix}_${counter}`;
-      counter++;
-    }
+    const safeFilename = sanitizeFilename(archiveName);
+    console.log(`正在保存存档: 原始名称='${archiveName}', 安全名称='${safeFilename}'`);
 
-    console.log(`正在保存版本化存档: 基础名称='${safeBaseName}', 最终名称='${finalArchiveName}'`);
+    client = await pool.connect();
+    await client.query("BEGIN");
 
-    // 此时名字绝对唯一，直接 INSERT 即可，不再需要 ON CONFLICT 覆盖
-    await pool.query(
-      `INSERT INTO cloud_saves (archive_name, data) VALUES ($1, $2)`,
-      [finalArchiveName, payload.data]
+    // 1) 主表同名覆盖 (恢复旧版行为, 卡片端依赖稳定存档名)
+    await client.query(
+      `INSERT INTO cloud_saves (archive_name, data) 
+       VALUES ($1, $2) 
+       ON CONFLICT (archive_name) 
+       DO UPDATE SET data = EXCLUDED.data, updated_at = CURRENT_TIMESTAMP`,
+      [safeFilename, payload.data]
     );
-    
-    return c.json({ success: true, message: "存档新版本已成功保存", savedName: finalArchiveName });
+
+    // 2) 版本表追加历史版本
+    await client.query(
+      `INSERT INTO cloud_save_versions (archive_name, data) VALUES ($1, $2)`,
+      [safeFilename, payload.data]
+    );
+
+    // 3) 裁剪历史版本, 只保留最近 MAX_VERSIONS 条
+    await client.query(
+      `DELETE FROM cloud_save_versions 
+       WHERE archive_name = $1 AND id NOT IN (
+         SELECT id FROM cloud_save_versions WHERE archive_name = $1 ORDER BY id DESC LIMIT $2
+       )`,
+      [safeFilename, MAX_VERSIONS]
+    );
+
+    await client.query("COMMIT");
+    return c.json({ success: true, message: "存档已成功保存", savedName: safeFilename });
   } catch (e: any) {
+    if (client) await client.query("ROLLBACK").catch(() => {});
     console.error("保存存档失败:", e);
     return c.json({ success: false, error: `无法保存存档: ${e.message}` }, 500);
+  } finally {
+    if (client) client.release();
   }
 });
 
-// DELETE /delete
-api.delete("/delete", async (c) => {
+// GET /versions (列出一个存档的历史版本, 供回滚使用)
+api.get("/versions", async (c) => {
   const archiveName = c.req.query("archiveName");
   if (!archiveName) return c.json({ success: false, error: "Missing archiveName query" }, 400);
 
   const safeFilename = sanitizeFilename(archiveName);
   try {
-    const result = await pool.query("DELETE FROM cloud_saves WHERE archive_name = $1", [safeFilename]);
+    const result = await pool.query(
+      `SELECT id, created_at FROM cloud_save_versions WHERE archive_name = $1 ORDER BY id DESC`,
+      [safeFilename]
+    );
+    return c.json({ success: true, versions: result.rows });
+  } catch (e: any) {
+    return c.json({ success: false, error: `无法列出版本: ${e.message}` }, 500);
+  }
+});
+
+// GET /load_version (按版本 id 加载历史版本)
+api.get("/load_version", async (c) => {
+  const id = c.req.query("id");
+  if (!id || !/^[0-9]+$/.test(id)) return c.json({ success: false, error: "Missing or invalid id query" }, 400);
+
+  try {
+    const result = await pool.query(
+      `SELECT archive_name, data, created_at FROM cloud_save_versions WHERE id = $1`,
+      [Number(id)]
+    );
+    if (result.rowCount === 0) return c.json({ success: false, error: "版本未找到" }, 404);
+    return c.json({ success: true, archiveName: result.rows[0].archive_name, createdAt: result.rows[0].created_at, data: result.rows[0].data });
+  } catch (e: any) {
+    return c.json({ success: false, error: `无法加载版本: ${e.message}` }, 500);
+  }
+});
+
+// DELETE /delete (同时删除该存档的全部历史版本)
+api.delete("/delete", async (c) => {
+  const archiveName = c.req.query("archiveName");
+  if (!archiveName) return c.json({ success: false, error: "Missing archiveName query" }, 400);
+
+  const safeFilename = sanitizeFilename(archiveName);
+  let client;
+  try {
+    client = await pool.connect();
+    await client.query("BEGIN");
+    const result = await client.query("DELETE FROM cloud_saves WHERE archive_name = $1", [safeFilename]);
+    await client.query("DELETE FROM cloud_save_versions WHERE archive_name = $1", [safeFilename]);
+    await client.query("COMMIT");
+
     if (result.rowCount === 0) return c.json({ success: false, error: "存档未找到" }, 404);
     return c.json({ success: true, message: "存档已成功删除" });
   } catch (e: any) {
+    if (client) await client.query("ROLLBACK").catch(() => {});
     return c.json({ success: false, error: `无法删除存档: ${e.message}` }, 500);
+  } finally {
+    if (client) client.release();
   }
 });
 
 // --- 全局路由 ---
 app.get("/favicon.ico", () => new Response(null, { status: 204 }));
-app.get("/", (c) => c.json({ success: true, message: "Fanren Sync 运行中 (Postgres版本控制生效中)" }, 200));
+app.get("/", (c) => c.json({ success: true, message: "Fanren Sync 运行中 (Postgres 同名覆盖 + 版本历史)" }, 200));
 app.route("/:password/api", api);
 
 // --- 服务启动 ---
@@ -188,6 +285,6 @@ if (!syncPassword || !Deno.env.get("DATABASE_URL")) {
   console.error("错误: 请确保设置了 SYNC_PASSWORD 和 DATABASE_URL 环境变量。");
 } else {
   const port = 8000;
-  console.log(`🚀 Fanren-Sync v0.3.0 (Postgres Versioned) 启动于端口 ${port}`);
+  console.log(`🚀 Fanren-Sync v0.4.0 (Postgres Latest+Versions) 启动于端口 ${port}`);
   Deno.serve({ port, hostname: "0.0.0.0" }, app.fetch);
 }
